@@ -50,6 +50,9 @@ def load_model(fabric, model, load_dir):
         del state_dict[key]
     model.load_state_dict(state_dict, strict=False)
 
+def strip_pad_tokens(output, pad_token_id):
+    return [token for token in output if token != pad_token_id]
+
 
 # exact match: just use == on tokenized
 def soft_f1_score(output, gold_answer):
@@ -102,7 +105,7 @@ def train(**config):
     val_set_size = config["val_set_size"]
     gradient_accumulation_steps = config["gradient_accumulation_steps"]
 
-    MAX_LENGTH = 256
+    MAX_LENGTH = 400
 
     fabric = L.Fabric(
         accelerator="auto",
@@ -131,7 +134,7 @@ def train(**config):
         load_model(fabric, model, load_model_dir)
 
 
-    def tokenize_and_pad(data_point, max_length=None):
+    def tokenize_and_pad_left(data_point, max_length=None):
         input_text = data_point["input"]
         output_text = data_point["output"]
 
@@ -145,30 +148,22 @@ def train(**config):
         # Determine the target max_length, using max_length if provided or combined_length if not
         target_max_length = max_length if max_length is not None else combined_length
 
-        # Concatenate the tokenized sequences and pad to target_max_length
-        combined_tokens = input_tokens + output_tokens + [tokenizer.pad_token_id] * (target_max_length - combined_length)
-
-        input_ids = np.array(combined_tokens)
+        # Create the tokenized sequences with left padding
+        input_ids = [tokenizer.pad_token_id] * (target_max_length - combined_length) + input_tokens + output_tokens
 
         # Create attention mask
         attention_mask = np.zeros(target_max_length, dtype=np.int64)
-        attention_mask[:combined_length] = 1
+        attention_mask[target_max_length - combined_length:] = 1
 
         labels = np.full((target_max_length,), -100, dtype=np.int64)
-        labels[len(input_tokens):combined_length] = np.array(output_tokens, dtype=np.int64)
+        labels[target_max_length - combined_length:target_max_length - len(input_tokens)] = np.array(output_tokens, dtype=np.int64)
 
-        if max_length == None:
-            return {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels,
-            }
-        else:
-            return {
-                "input_ids": input_ids,
-                "attention_mask": attention_mask,
-                "labels": labels
-            }
+        return {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+
         
     def collate_fn(tokenized_samples):
         # Create a batch dictionary to hold the tensors
@@ -183,6 +178,20 @@ def train(**config):
 
         return batch
 
+    def test_collate_fn(tokenized_samples):
+        # Create a batch dictionary to hold the tensors
+        batch = {}
+
+        # Get a list of keys from the first sample
+        keys = tokenized_samples[0].keys()
+        # Loop through each key (e.g., 'input_ids', 'attention_mask', etc.)
+        for key in ['input_ids', 'attention_mask', 'labels']:
+            # Stack the tensors along a new batch dimension (dim=0)
+            batch[key] = torch.stack([torch.tensor(sample[key], dtype=torch.long) for sample in tokenized_samples], dim=0)
+
+        batch['output'] = [sample['output'] for sample in tokenized_samples]
+        return batch
+
 
     
     model = fabric.setup_module(model)
@@ -194,9 +203,9 @@ def train(**config):
     train_val = data["train"].train_test_split(
         test_size=val_set_size, shuffle=True, seed=42
     )
-    train_data = train_val["train"].shuffle().map(lambda data: tokenize_and_pad(data, max_length=MAX_LENGTH))
-    val_data = train_val["test"].shuffle().map(lambda data: tokenize_and_pad(data, max_length=MAX_LENGTH))
-    test_data = data["test"].shuffle().map(lambda data: tokenize_and_pad(data, max_length=None))
+    train_data = train_val["train"].shuffle().map(lambda data: tokenize_and_pad_left(data, max_length=MAX_LENGTH))
+    val_data = train_val["test"].shuffle().map(lambda data: tokenize_and_pad_left(data, max_length=MAX_LENGTH))
+    test_data = data["test"].shuffle().map(lambda data: tokenize_and_pad_left(data, max_length=MAX_LENGTH // 2))
 
     train_data = train_data.remove_columns(['instruction', 'input', 'gen_type', 'output'])
     val_data = val_data.remove_columns(['instruction', 'input', 'gen_type', 'output'])
@@ -217,9 +226,10 @@ def train(**config):
     )
     test_dataloader = torch.utils.data.DataLoader(
         test_data,
-        batch_size=1,
+        batch_size=bsz,
         shuffle=False,
         num_workers=num_workers,
+        collate_fn=test_collate_fn
     )
 
     optimizer = torch.optim.AdamW(
@@ -286,7 +296,7 @@ def train(**config):
             for batch in val_dataloader:
                 output = model(**batch)
                 loss = output.loss
-                eval_loss += loss.item()
+                eval_loss += loss.item() 
 
         eval_loss = eval_loss / len(test_dataloader)
 
@@ -297,25 +307,29 @@ def train(**config):
         exact_accuracy = 0
         soft_f1 = 0
         with torch.no_grad():
-            for datum in test_dataloader:
+            for batch in tqdm(test_dataloader):
                 outputs = model.generate(
-                    datum["input_ids"],
-                    attention_mask=datum["attention_mask"],
+                    batch["input_ids"],
+                    attention_mask=batch["attention_mask"],
                     max_new_tokens=100,
                     pad_token_id=50256,
                     generation_config=generation_config,
                 )
-                input_length = len(datum["input_ids"][0])
-                generated_tokens = outputs[:, input_length:]
-                text = tokenizer.decode(generated_tokens[0]).split(".")[0].strip()
 
-                exact_accuracy += text == datum["output"][0]
-                soft_f1 += soft_f1_score(text, datum["output"][0])
+                generated_tokens = outputs[:, -100:]
+                text = tokenizer.batch_decode(generated_tokens)
+                
+                for i, (text, gold_answer) in enumerate(zip(text, batch["output"])):
+                    if i == 0:
+                        print(f"Generated: {text}")
+                        print(f"Gold: {gold_answer}")
+                    exact_accuracy += text == gold_answer
+                    soft_f1 += soft_f1_score(text, gold_answer)
                 
         exact_accuracy /= len(test_dataloader)
         soft_f1 /= len(test_dataloader)
 
-        logging.info("Epoch %d exact accuracy: %f. f1: %f", epoch, test_accuracy, f1)
+        logging.info("Epoch %d exact accuracy: %f. f1: %f", epoch, exact_accuracy, soft_f1)
 
 
 def main():
@@ -342,8 +356,8 @@ def main():
     parser.add_argument("--optim", type=str, default="adamw")
     parser.add_argument("--val_set_size", type=int, default=256)
     parser.add_argument("--warmup_iters", type=int, default=1000)
-    parser.add_argument("--epochs", type=int, default=1)
-    parser.add_argument("--bsz", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=3)
+    parser.add_argument("--bsz", type=int, default=50)
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
 
     args = parser.parse_args()
